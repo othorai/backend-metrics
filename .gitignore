@@ -1,0 +1,14 @@
+# Ignore environment variable files
+.env
+
+# Ignore virtual environments
+venv/
+
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+
+# Ignore cache directories for other tools
+.cache/
+arkham.py
+arkham.csv

@@ -1,0 +1,86 @@
+{
+    "family": "backend-metrics",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "256",
+    "memory": "512",
+    "executionRoleArn": "arn:aws:iam::533267025675:role/ecsTaskExecutionRole",
+    "containerDefinitions": [
+        {
+            "name": "backend-metrics",
+            "image": "533267025675.dkr.ecr.eu-north-1.amazonaws.com/backend-metrics:latest",
+            "portMappings": [
+                {
+                    "containerPort": 8000,
+                    "protocol": "tcp"
+                }
+            ],
+            "environment": [
+                {
+                    "name": "DB_HOST",
+                    "value": "database-1.crocawauiu36.eu-north-1.rds.amazonaws.com"
+                },
+                {
+                    "name": "DB_PORT",
+                    "value": "5432"
+                },
+                {
+                    "name": "DB_NAME",
+                    "value": "othor_db"
+                },
+                {
+                    "name": "PYTHONPATH",
+                    "value": "/app"
+                },
+                {
+                    "name": "ALLOWED_HOSTS",
+                    "value": "*"
+                },
+                {
+                    "name": "DEBUG",
+                    "value": "True"
+                }
+            ],
+            "secrets": [
+                {
+                    "name": "DB_USER",
+                    "valueFrom": "arn:aws:ssm:eu-north-1:533267025675:parameter/fastapi/db_user"
+                },
+                {
+                    "name": "DB_PASSWORD",
+                    "valueFrom": "arn:aws:ssm:eu-north-1:533267025675:parameter/fastapi/db_password"
+                },
+                {
+                    "name": "SECRET_KEY",
+                    "valueFrom": "arn:aws:ssm:eu-north-1:533267025675:parameter/fastapi/secret_key"
+                },
+                {
+                    "name": "OPENAI_API_KEY",
+                    "valueFrom": "arn:aws:ssm:eu-north-1:533267025675:parameter/fastapi/openai_api_key"
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/backend-metrics",
+                    "awslogs-region": "eu-north-1",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            },
+            "essential": true,
+            "healthCheck": {
+                "command": ["CMD-SHELL", "nc -z localhost 8000 || exit 1"],
+                "interval": 30,
+                "timeout": 5,
+                "retries": 3,
+                "startPeriod": 60
+            }
+        }
+    ],
+    "tags": [
+        {
+            "key": "Environment",
+            "value": "Production"
+        }
+    ]
+}
