@@ -332,7 +332,7 @@ class DynamicAnalysisService:
 
     def _get_connector(self, connection: DataSourceConnection):
         """Get appropriate database connector."""
-        from connectors.connector_factory import ConnectorFactory
+        from app.connectors.connector_factory import ConnectorFactory
         return ConnectorFactory.get_connector(
             connection.source_type,
             **connection.connection_params

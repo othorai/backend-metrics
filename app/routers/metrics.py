@@ -313,17 +313,79 @@ async def get_metrics(
     resolution: str = Query("monthly", description="Data resolution"),
     forecast: bool = Query(False, description="Include forecasts")
 ):
-    analysis_service = DynamicAnalysisService()
-    
-    metrics = await analysis_service.analyze_metrics(
-        db=db,
-        org_id=current_user["current_org_id"],
-        scope=scope,
-        resolution=resolution,
-        forecast=forecast
-    )
-    
-    return metrics
+    try:
+        # 1. Log initial request details
+        logger.info(f"""
+        Fetching metrics:
+        Organization ID: {current_user['current_org_id']}
+        Scope: {scope}
+        Resolution: {resolution}
+        """)
+
+        # 2. Verify data source connections
+        connections = db.query(DataSourceConnection).filter(
+            DataSourceConnection.organization_id == current_user["current_org_id"]
+        ).all()
+        
+        logger.info(f"Found {len(connections)} data sources")
+        for conn in connections:
+            logger.info(f"""
+            Connection Details:
+            ID: {conn.id}
+            Name: {conn.name}
+            Type: {conn.source_type}
+            Table: {conn.table_name}
+            """)
+
+        # 3. Verify metric definitions
+        metrics = db.query(MetricDefinition).filter(
+            MetricDefinition.connection_id.in_([conn.id for conn in connections]),
+            MetricDefinition.is_active == True
+        ).all()
+        
+        logger.info(f"Found {len(metrics)} active metrics")
+        for metric in metrics:
+            logger.info(f"""
+            Metric Details:
+            ID: {metric.id}
+            Name: {metric.name}
+            Category: {metric.category}
+            Calculation: {metric.calculation}
+            Connection ID: {metric.connection_id}
+            """)
+
+        # 4. Try to fetch actual data
+        analysis_service = DynamicAnalysisService()
+        
+        # 5. Add logging to DynamicAnalysisService
+        for connection in connections:
+            try:
+                # Test database connection
+                connector = analysis_service._get_connector(connection)
+                test_query = f"SELECT COUNT(*) FROM {connection.table_name}"
+                result = connector.query(test_query)
+                logger.info(f"Successfully connected to {connection.name}. Row count: {result}")
+            except Exception as e:
+                logger.error(f"Error connecting to {connection.name}: {str(e)}")
+                continue
+
+        # 6. Get metrics with detailed logging
+        metrics_result = await analysis_service.analyze_metrics(
+            db=db,
+            org_id=current_user["current_org_id"],
+            scope=scope,
+            resolution=resolution,
+            forecast=forecast
+        )
+        
+        return metrics_result
+
+    except Exception as e:
+        logger.error(f"Error in get_metrics: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving metrics: {str(e)}"
+        )
 
 @router.get("/metric_names")
 async def get_available_metrics(
