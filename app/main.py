@@ -6,7 +6,7 @@ from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-app = FastAPI()
+app = FastAPI(root_path="/backend-metrics")
 
 
 @app.middleware("http")
