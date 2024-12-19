@@ -2,6 +2,7 @@ import psycopg2
 import psycopg2.extras
 from app.connectors.base import BaseConnector
 import logging
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,7 +17,8 @@ class PostgreSQLConnector(BaseConnector):
         self.database = database
         self.port = int(port) if port else 5432
         self.connection = None
-        self.schema = 'public'  # Default schema
+        self.schema = 'public'
+        self.sslmode = os.getenv('POSTGRES_SSLMODE', 'prefer')
 
     def connect(self):
         """Establish connection to PostgreSQL with error handling."""
@@ -28,7 +30,7 @@ class PostgreSQLConnector(BaseConnector):
                 password=self.password,
                 dbname=self.database,
                 port=self.port,
-                sslmode='require',
+                sslmode=self.sslmode,
                 connect_timeout=10
             )
             # Test connection immediately

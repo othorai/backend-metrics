@@ -25,10 +25,10 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str
 
 
+    DB_SSLMODE: str = "disable"
     @property
     def DATABASE_URL(self):
-        url = f"postgresql://{self.DB_USER}:{quote_plus(self.DB_PASSWORD)}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}?sslmode=require"
-        print(f"Constructed DATABASE_URL: {url}")
+        url = f"postgresql://{self.DB_USER}:{quote_plus(self.DB_PASSWORD)}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}?sslmode={self.DB_SSLMODE}"
         return url
 
     @property
