@@ -486,6 +486,16 @@ class DynamicAnalysisService:
             return f"DATE_TRUNC('{trunc_unit}', {date_column})"
         else:  # PostgreSQL and others
             return f"DATE_TRUNC('{trunc_unit}', {date_column})"
+        
+    def _build_metric_calculations(self, metrics: List[MetricDefinition]) -> List[str]:
+        """Build SQL-safe metric calculations."""
+        metric_calculations = []
+        for metric in metrics:
+            calc = self._sanitize_calculation(metric.calculation, {})
+            # Use snake_case for alias names to avoid SQL errors
+            safe_alias = metric.name.lower().replace(' ', '_')
+            metric_calculations.append(f"{calc} as {safe_alias}")
+        return metric_calculations
 
     async def _fetch_metric_data(
         self,
@@ -499,11 +509,8 @@ class DynamicAnalysisService:
             # Get date range
             start_date, end_date = self._get_date_range(scope)
             
-            # Build metric calculations
-            metric_calculations = []
-            for metric in metrics:
-                calc = self._sanitize_calculation(metric.calculation, {})
-                metric_calculations.append(f"{calc} as {metric.name}")
+            # Build metric calculations with safe aliases
+            metric_calculations = self._build_metric_calculations(metrics)
 
             # Build date truncation expression
             period_expression = self._build_date_trunc_expression(
@@ -512,7 +519,7 @@ class DynamicAnalysisService:
                 connection.source_type
             )
 
-            # Build the complete query
+            # Build the query with snake_case aliases
             query = f"""
             WITH metric_data AS (
                 SELECT 
