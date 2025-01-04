@@ -332,12 +332,31 @@ class DynamicAnalysisService:
         )
 
     def _get_connector(self, connection: DataSourceConnection):
-        """Get appropriate database connector."""
-        from app.connectors.connector_factory import ConnectorFactory
-        return ConnectorFactory.get_connector(
-            connection.source_type,
-            **connection.connection_params
-        )
+        """Get appropriate database connector with proper SSL configuration."""
+        try:
+            params = connection.connection_params.copy()
+            host = params.get('host', '')
+
+            # Determine SSL mode based on host
+            if '.rds.amazonaws.com' in host.lower():
+                params['sslmode'] = 'require'
+                logger.info(f"Using SSL mode 'require' for RDS database at {host}")
+            elif host in ('localhost', '127.0.0.1', 'postgres') or host.startswith(('172.', '192.168.', '10.')):
+                params['sslmode'] = 'disable'
+                logger.info(f"Using SSL mode 'disable' for local database at {host}")
+            else:
+                params['sslmode'] = 'prefer'
+                logger.info(f"Using SSL mode 'prefer' for unknown host type at {host}")
+
+            from app.connectors.connector_factory import ConnectorFactory
+            return ConnectorFactory.get_connector(
+                connection.source_type,
+                **params
+            )
+
+        except Exception as e:
+            logger.error(f"Error creating database connector: {str(e)}")
+            raise
     
     async def analyze_metrics(
         self,
@@ -347,17 +366,25 @@ class DynamicAnalysisService:
         resolution: str = "monthly",
         forecast: bool = False
     ) -> Dict[str, Any]:
-        """Analyze metrics across all data sources with optional forecasting."""
+        """Analyze metrics with improved error handling and SSL configuration."""
         try:
-            # Get all data sources
+            # Get all data source connections
             connections = db.query(DataSourceConnection).filter(
                 DataSourceConnection.organization_id == org_id
             ).all()
 
-            if not connections:
-                return self._format_empty_response(scope, resolution)
-
-            aggregated_metrics = {}
+            metrics_result = {
+                "metadata": {
+                    "scope": scope,
+                    "resolution": resolution,
+                    "organization_id": org_id,
+                    "start_date": None,
+                    "end_date": None
+                },
+                "metrics": {},
+                "sources": [],
+                "connection_status": {}
+            }
 
             for connection in connections:
                 try:
@@ -367,40 +394,113 @@ class DynamicAnalysisService:
                         MetricDefinition.is_active == True
                     ).all()
 
-                    if not metrics:
-                        continue
+                    # Add metrics definitions to result regardless of data fetch success
+                    for metric in metrics:
+                        metric_key = metric.name.lower().replace(" ", "_")
+                        metrics_result["metrics"][metric_key] = {
+                            "id": metric.id,
+                            "name": metric.name,
+                            "category": metric.category,
+                            "calculation": metric.calculation,
+                            "visualization_type": metric.visualization_type,
+                            "business_context": metric.business_context,
+                            "data_available": False,  # Will be set to True if data fetch succeeds
+                            "source": connection.name
+                        }
 
-                    # Build and execute query
-                    results = await self._fetch_metric_data(
-                        connection=connection,
-                        metrics=metrics,
-                        scope=scope,
-                        resolution=resolution
-                    )
-                    
-                    if results:
-                        source_metrics = self._process_source_metrics(
-                            results=results,
+                    # Try to fetch actual data
+                    try:
+                        connector = self._get_connector(connection)
+                        
+                        # Test connection
+                        test_query = f"SELECT COUNT(*) FROM {connection.table_name}"
+                        result = connector.query(test_query)
+                        logger.info(f"Successfully connected to {connection.name}. Row count: {result}")
+
+                        # Fetch metric data
+                        results = await self._fetch_metric_data(
+                            connection=connection,
                             metrics=metrics,
-                            source_name=connection.name
+                            scope=scope,
+                            resolution=resolution
                         )
-                        self._merge_metrics(aggregated_metrics, source_metrics)
+
+                        if results:
+                            source_metrics = self._process_source_metrics(
+                                results=results,
+                                metrics=metrics,
+                                source_name=connection.name
+                            )
+
+                            # Update metrics with actual data
+                            for metric_name, metric_data in source_metrics.items():
+                                metric_key = metric_name.lower().replace(" ", "_")
+                                if metric_key in metrics_result["metrics"]:
+                                    metrics_result["metrics"][metric_key].update({
+                                        "data_available": True,
+                                        "current_value": metric_data.get("current"),
+                                        "previous_value": metric_data.get("previous"),
+                                        "change": {
+                                            "absolute": metric_data.get("current", 0) - metric_data.get("previous", 0),
+                                            "percentage": self._calculate_percentage_change(
+                                                metric_data.get("current", 0),
+                                                metric_data.get("previous", 0)
+                                            )
+                                        },
+                                        "trend_data": metric_data.get("trend_data", []),
+                                        "dimensions": metric_data.get("dimensions", {})
+                                    })
+
+                            # Add source status
+                            metrics_result["connection_status"][connection.name] = {
+                                "status": "connected",
+                                "message": "Successfully connected and fetched data"
+                            }
+
+                        metrics_result["sources"].append({
+                            "name": connection.name,
+                            "type": connection.source_type,
+                            "metrics_count": len(metrics)
+                        })
+
+                    except Exception as e:
+                        logger.error(f"Error fetching data from {connection.name}: {str(e)}")
+                        metrics_result["connection_status"][connection.name] = {
+                            "status": "error",
+                            "message": str(e)
+                        }
+                    finally:
+                        if 'connector' in locals() and connector:
+                            connector.disconnect()
 
                 except Exception as e:
-                    logger.error(f"Error processing metrics from {connection.name}: {str(e)}")
+                    logger.error(f"Error processing connection {connection.name}: {str(e)}")
                     continue
 
-            # Format and return response
-            return self._format_metrics_response(
-                metrics=aggregated_metrics,
-                scope=scope,
-                resolution=resolution,
-                has_forecast=forecast
-            )
+            # Set date range in metadata
+            start_date, end_date = self._get_date_range(scope)
+            metrics_result["metadata"]["start_date"] = start_date.isoformat()
+            metrics_result["metadata"]["end_date"] = end_date.isoformat()
+
+            return metrics_result
 
         except Exception as e:
-            logger.error(f"Error analyzing metrics: {str(e)}")
-            return self._format_empty_response(scope, resolution)
+            logger.error(f"Error in analyze_metrics: {str(e)}")
+            start_date, end_date = self._get_date_range(scope)
+            return {
+                "metadata": {
+                    "scope": scope,
+                    "resolution": resolution,
+                    "organization_id": org_id,
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat()
+                },
+                "metrics": {},
+                "sources": [],
+                "connection_status": {
+                    "error": str(e)
+                }
+            }
 
     def _get_date_trunc_unit(self, resolution: str, database_type: str) -> str:
         """
@@ -505,13 +605,17 @@ class DynamicAnalysisService:
         scope: str,
         resolution: str
     ) -> List[Dict[str, Any]]:
-        """Fetch metric data from a data source."""
+        """Fetch metric data from a data source with better error handling."""
         try:
             # Get date range
             start_date, end_date = self._get_date_range(scope)
-            
-            # Build metric calculations with safe aliases
-            metric_calculations = self._build_metric_calculations(metrics)
+            logger.info(f"Fetching data for period: {start_date} to {end_date}")
+
+            # Build metric calculations
+            metric_calculations = []
+            for metric in metrics:
+                safe_name = metric.name.lower().replace(' ', '_')
+                metric_calculations.append(f"{metric.calculation} as {safe_name}")
 
             # Build date truncation expression
             period_expression = self._build_date_trunc_expression(
@@ -520,25 +624,30 @@ class DynamicAnalysisService:
                 connection.source_type
             )
 
-            # Build the query with snake_case aliases
+            # Build and execute query
             query = f"""
             WITH metric_data AS (
                 SELECT 
                     {period_expression} as period,
                     {', '.join(metric_calculations)}
                 FROM {connection.table_name}
-                WHERE {connection.date_column} BETWEEN '{start_date}' AND '{end_date}'
+                WHERE {connection.date_column} BETWEEN %s AND %s
                 GROUP BY period
+                ORDER BY period DESC
             )
             SELECT * FROM metric_data
-            ORDER BY period DESC
             """
 
-            # Execute query
+            # Execute query with parameters
             connector = self._get_connector(connection)
-            results = connector.query(query)
-            
-            return results
+            try:
+                results = connector.query(query, (start_date, end_date))
+                logger.info(f"Query returned {len(results)} rows")
+                if results:
+                    logger.info(f"Sample result: {results[0]}")
+                return results
+            finally:
+                connector.disconnect()
 
         except Exception as e:
             logger.error(f"Error fetching metric data: {str(e)}")
@@ -589,6 +698,7 @@ class DynamicAnalysisService:
             logger.error(f"Error processing query results: {str(e)}")
             return results
 
+    
     def _process_source_metrics(
         self,
         results: List[Dict[str, Any]],
@@ -598,25 +708,68 @@ class DynamicAnalysisService:
         """Process raw metrics results into structured format."""
         try:
             processed_metrics = {}
-            df = pd.DataFrame(results)
+            df = pd.DataFrame(results) if results else pd.DataFrame()
 
             for metric in metrics:
                 try:
-                    if metric.name not in df.columns:
-                        continue
+                    metric_key = metric.name.lower().replace(' ', '_')
 
-                    current_value = float(df[metric.name].iloc[0]) if not df.empty else 0
-                    previous_value = float(df[metric.name].iloc[1]) if len(df) > 1 else 0
+                    if not df.empty and metric_key in df.columns:
+                        current_value = float(df[metric_key].iloc[0]) if not pd.isna(df[metric_key].iloc[0]) else 0
+                        previous_value = float(df[metric_key].iloc[1]) if len(df) > 1 and not pd.isna(df[metric_key].iloc[1]) else 0
+                        
+                        # Calculate changes
+                        absolute_change = current_value - previous_value
+                        percentage_change = (
+                            (absolute_change / previous_value * 100)
+                            if previous_value != 0 else 0
+                        )
 
-                    processed_metrics[metric.name] = {
-                        "current": current_value,
-                        "previous": previous_value,
-                        "source": source_name,
-                        "category": metric.category,
-                        "visualization_type": metric.visualization_type,
-                        "trend_data": self._get_trend_data(df, metric.name),
-                        "dimensions": self._get_dimensional_data(df, metric.name)
-                    }
+                        # Format trend data
+                        trend_data = []
+                        for _, row in df.iterrows():
+                            if pd.notnull(row[metric_key]) and pd.notnull(row['period']):
+                                trend_data.append({
+                                    "date": row['period'].isoformat() if hasattr(row['period'], 'isoformat') else row['period'],
+                                    "value": float(row[metric_key])
+                                })
+
+                        processed_metrics[metric.name] = {
+                            "id": metric.id,
+                            "name": metric.name,
+                            "category": metric.category,
+                            "current_value": current_value,
+                            "previous_value": previous_value,
+                            "change": {
+                                "absolute": absolute_change,
+                                "percentage": percentage_change
+                            },
+                            "trend": "up" if percentage_change > 0 else "down",
+                            "source": source_name,
+                            "visualization_type": metric.visualization_type,
+                            "trend_data": trend_data,
+                            "data_available": True,
+                            "business_context": metric.business_context
+                        }
+                    else:
+                        # Return structure for metrics with no data
+                        processed_metrics[metric.name] = {
+                            "id": metric.id,
+                            "name": metric.name,
+                            "category": metric.category,
+                            "current_value": 0,
+                            "previous_value": 0,
+                            "change": {
+                                "absolute": 0,
+                                "percentage": 0
+                            },
+                            "trend": "stable",
+                            "source": source_name,
+                            "visualization_type": metric.visualization_type,
+                            "trend_data": [],
+                            "data_available": False,
+                            "business_context": metric.business_context
+                        }
 
                 except Exception as e:
                     logger.error(f"Error processing metric {metric.name}: {str(e)}")

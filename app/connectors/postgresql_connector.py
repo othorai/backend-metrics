@@ -1,3 +1,5 @@
+# connectors/postgresql_connector.py
+
 import psycopg2
 import psycopg2.extras
 from app.connectors.base import BaseConnector
@@ -9,8 +11,8 @@ logger = logging.getLogger(__name__)
 
 class PostgreSQLConnector(BaseConnector):
     def __init__(self, host, username, password, database, port=5432):
-        super().__init__()  # Call parent constructor
-        self.source_type = 'postgresql'  # Set the source type
+        super().__init__()
+        self.source_type = 'postgresql'
         self.host = host
         self.username = username
         self.password = password
@@ -18,12 +20,47 @@ class PostgreSQLConnector(BaseConnector):
         self.port = int(port) if port else 5432
         self.connection = None
         self.schema = 'public'
-        self.sslmode = os.getenv('POSTGRES_SSLMODE', 'prefer')
+        
+        # Determine SSL mode based on host
+        self.sslmode = self._determine_ssl_mode(host)
+        
+    def _determine_ssl_mode(self, host):
+        """Determine SSL mode based on the host."""
+        # List of patterns that indicate external/cloud databases
+        cloud_patterns = [
+            '.rds.amazonaws.com',  # AWS RDS
+            '.postgres.database.azure.com',  # Azure Database
+            '.cloudsql.google.com',  # Google Cloud SQL
+            '.elephantsql.com',  # ElephantSQL
+            '.supabase.co',  # Supabase
+            '.render.com',  # Render
+            '.herokuapp.com'  # Heroku
+        ]
+        
+        # Check if host matches any cloud pattern
+        is_cloud_db = any(pattern in host.lower() for pattern in cloud_patterns)
+        
+        # Check if host is localhost or Docker internal network
+        is_local = (
+            host in ('localhost', '127.0.0.1', 'postgres') or  # Local/Docker service name
+            host.startswith('172.') or  # Docker network
+            host.startswith('192.168.') or  # Local network
+            host.startswith('10.')  # Local network
+        )
+        
+        if is_cloud_db:
+            return 'require'  # Force SSL for cloud databases
+        elif is_local:
+            return 'disable'  # Disable SSL for local development
+        else:
+            return 'prefer'  # Default to prefer SSL for unknown hosts
 
     def connect(self):
         """Establish connection to PostgreSQL with error handling."""
         try:
             logger.info(f"Attempting to connect to PostgreSQL database {self.database} as user {self.username}")
+            logger.info(f"Using SSL mode: {self.sslmode} for host: {self.host}")
+            
             self.connection = psycopg2.connect(
                 host=self.host,
                 user=self.username,
@@ -41,16 +78,30 @@ class PostgreSQLConnector(BaseConnector):
             
         except psycopg2.OperationalError as e:
             logger.error(f"PostgreSQL connection error: {str(e)}")
-            # Clean up the connection if it was created
             if self.connection:
                 self.connection.close()
                 self.connection = None
-            if "authentication failed" in str(e):
-                raise ValueError(f"Authentication failed for user '{self.username}'. Please verify credentials.")
-            elif "could not connect to server" in str(e):
-                raise ValueError(f"Could not connect to database server at {self.host}:{self.port}. Please verify connection details.")
+                
+            # Provide more specific error messages
+            if "no pg_hba.conf entry" in str(e):
+                if self.sslmode == 'require':
+                    raise ValueError(
+                        f"Connection to {self.host} failed. Please verify your security group rules "
+                        "and ensure the database is configured to accept SSL connections."
+                    )
+                else:
+                    raise ValueError(
+                        f"Connection to {self.host} failed. Please verify your connection settings "
+                        "and ensure the database is configured to accept connections from your IP address."
+                    )
+            elif "certificate verify failed" in str(e):
+                raise ValueError(
+                    f"SSL certificate verification failed. If you trust this database, "
+                    "you may need to configure your SSL certificates properly."
+                )
             else:
                 raise ValueError(f"Database connection failed: {str(e)}")
+                
         except Exception as e:
             logger.error(f"Unexpected error during PostgreSQL connection: {str(e)}")
             if self.connection:
