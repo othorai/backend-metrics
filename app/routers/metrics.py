@@ -5,6 +5,7 @@ from app.utils.database import get_db
 from app.models.models import WayneEnterprise
 import pandas as pd
 import numpy as np
+import calendar
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple, Union, Any
 from sqlalchemy import func
@@ -25,34 +26,53 @@ logger = logging.getLogger(__name__)
 
 # Calculate the date range based on the given duration
 def get_date_range(scope: str):
+    """Calculate date range based on rolling periods from today."""
     today = datetime.now().date()
-    year_start = datetime(today.year, 1, 1).date()
     
-    if scope == 'this_week':
-        start_date = today - timedelta(days=today.weekday())
-        return start_date, today
-    elif scope == 'this_month':
-        start_date = today.replace(day=1)
-        return start_date, today
-    elif scope == 'this_quarter':
-        quarter = (today.month - 1) // 3 + 1
-        start_date = datetime(today.year, 3 * quarter - 2, 1).date()
-        return start_date, today
-    else:  # this_year (default)
-        return year_start, today
+    if scope == 'past_7_days':
+        start_date = today - timedelta(days=7)
+    elif scope == 'past_30_days':
+        start_date = today - timedelta(days=30)
+    elif scope == 'past_4_months':
+        # Calculate start date as 4 months ago from today
+        year = today.year
+        month = today.month - 4  # Go back 4 months
+        
+        # Handle year boundary
+        if month <= 0:
+            month = 12 + month
+            year -= 1
+            
+        start_date = datetime(year, month, today.day).date()
+    elif scope == 'past_12_months':
+        # Calculate start date as 12 months ago from today
+        start_date = today.replace(year=today.year - 1)
+    else:  # Default to past 30 days
+        start_date = today - timedelta(days=30)
     
-def get_forecast_end_date(forecast_duration: str, start_date: datetime.date):
-    if forecast_duration == 'next_week':
-        return start_date + timedelta(days=7)
-    elif forecast_duration == 'next_month':
-        next_month = start_date.replace(day=28) + timedelta(days=4)
-        return next_month - timedelta(days=next_month.day)
-    elif forecast_duration == 'next_quarter':
-        days_in_quarter = 91  # Approximately 3 months
-        return start_date + timedelta(days=days_in_quarter)
-    else:  # this_year (rest of the year)
-        return datetime(start_date.year, 12, 31).date()
+    return start_date, today
 
+def get_forecast_end_date(forecast_duration: str, start_date: datetime.date):
+    """Calculate forecast end date based on duration."""
+    if forecast_duration == 'next_7_days':
+        return start_date + timedelta(days=7)
+    elif forecast_duration == 'next_30_days':
+        return start_date + timedelta(days=30)
+    elif forecast_duration == 'next_4_months':
+        end_date = start_date
+        for _ in range(4):
+            next_month = end_date.replace(day=28) + timedelta(days=4)
+            end_date = next_month - timedelta(days=next_month.day - 1)
+        return end_date
+    elif forecast_duration == 'next_12_months':
+        end_date = start_date
+        for _ in range(12):
+            next_month = end_date.replace(day=28) + timedelta(days=4)
+            end_date = next_month - timedelta(days=next_month.day - 1)
+        return end_date
+    else:  # Default to next 30 days
+        return start_date + timedelta(days=30)
+    
 # Fetch data from the database for the given date range
 def fetch_data(db: Session, start_date: datetime, end_date: datetime):
     data = db.query(WayneEnterprise).filter(WayneEnterprise.date.between(start_date, end_date)).all()
@@ -305,71 +325,29 @@ def get_forecast(
         "forecast": forecast_results
     }
 
+
 @router.get("/metric_cards")
 async def get_metrics(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
-    scope: str = Query("this_year", description="Data scope"),
+    scope: str = Query("past_30_days", description="Data scope"),
     resolution: str = Query("monthly", description="Data resolution"),
     forecast: bool = Query(False, description="Include forecasts")
 ):
     try:
-        # 1. Log initial request details
+        # Get date range based on scope
+        start_date, end_date = get_date_range(scope)
+        
         logger.info(f"""
         Fetching metrics:
         Organization ID: {current_user['current_org_id']}
         Scope: {scope}
         Resolution: {resolution}
+        Date Range: {start_date} to {end_date}
         """)
 
-        # 2. Verify data source connections
-        connections = db.query(DataSourceConnection).filter(
-            DataSourceConnection.organization_id == current_user["current_org_id"]
-        ).all()
-        
-        logger.info(f"Found {len(connections)} data sources")
-        for conn in connections:
-            logger.info(f"""
-            Connection Details:
-            ID: {conn.id}
-            Name: {conn.name}
-            Type: {conn.source_type}
-            Table: {conn.table_name}
-            """)
-
-        # 3. Verify metric definitions
-        metrics = db.query(MetricDefinition).filter(
-            MetricDefinition.connection_id.in_([conn.id for conn in connections]),
-            MetricDefinition.is_active == True
-        ).all()
-        
-        logger.info(f"Found {len(metrics)} active metrics")
-        for metric in metrics:
-            logger.info(f"""
-            Metric Details:
-            ID: {metric.id}
-            Name: {metric.name}
-            Category: {metric.category}
-            Calculation: {metric.calculation}
-            Connection ID: {metric.connection_id}
-            """)
-
-        # 4. Try to fetch actual data
+        # Get metrics with calculated date range
         analysis_service = DynamicAnalysisService()
-        
-        # 5. Add logging to DynamicAnalysisService
-        for connection in connections:
-            try:
-                # Test database connection
-                connector = analysis_service._get_connector(connection)
-                test_query = f"SELECT COUNT(*) FROM {connection.table_name}"
-                result = connector.query(test_query)
-                logger.info(f"Successfully connected to {connection.name}. Row count: {result}")
-            except Exception as e:
-                logger.error(f"Error connecting to {connection.name}: {str(e)}")
-                continue
-
-        # 6. Get metrics with detailed logging
         metrics_result = await analysis_service.analyze_metrics(
             db=db,
             org_id=current_user["current_org_id"],
@@ -377,6 +355,33 @@ async def get_metrics(
             resolution=resolution,
             forecast=forecast
         )
+        
+        # Include date range in response metadata
+        if "metadata" not in metrics_result:
+            metrics_result["metadata"] = {}
+        
+        metrics_result["metadata"].update({
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "scope": scope,
+            "resolution": resolution
+        })
+        
+        # Update the metrics data with the correct date range
+        if "metrics" in metrics_result:
+            for metric_name, metric_data in metrics_result["metrics"].items():
+                if "trend_data" in metric_data:
+                    # Filter trend data to only include points within our date range
+                    filtered_trend_data = [
+                        point for point in metric_data["trend_data"]
+                        if start_date.isoformat() <= point["date"] <= end_date.isoformat()
+                    ]
+                    metric_data["trend_data"] = filtered_trend_data
+                
+                # Update metric start and end dates
+                if metric_data.get("trend_data"):
+                    metric_data["start_date"] = start_date.isoformat()
+                    metric_data["end_date"] = end_date.isoformat()
         
         return metrics_result
 
@@ -431,7 +436,7 @@ async def get_available_metrics(
         )
 
 @router.get("/metric_forecast")
-def get_metric_forecast(
+async def get_metric_forecast(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     metric_id: int = Query(..., description="ID of the metric to forecast"),
@@ -440,7 +445,6 @@ def get_metric_forecast(
 ):
     """Get forecast for a specific metric."""
     try:
-        # Get the metric definition
         metric = (
             db.query(MetricDefinition)
             .join(DataSourceConnection)
@@ -459,7 +463,7 @@ def get_metric_forecast(
             )
 
         analysis_service = DynamicAnalysisService()
-        forecast_data = analysis_service.generate_forecast(
+        forecast_data = await analysis_service.generate_forecast(  # Properly await the async function
             db=db,
             org_id=current_user["current_org_id"],
             metric=metric,
@@ -477,7 +481,7 @@ def get_metric_forecast(
             status_code=500,
             detail=f"Error generating forecast: {str(e)}"
         )
-
+    
 @router.get("/bulk_forecast")
 async def get_bulk_forecast(
     db: Session = Depends(get_db),
@@ -637,7 +641,44 @@ def get_forecastable_metrics(
         )
 
 
-# Add the forecast generation method to DynamicAnalysisService
+def _get_frequency_by_resolution(resolution: str) -> str:
+    """Get pandas frequency string based on resolution."""
+    resolution_map = {
+        'daily': 'D',
+        'weekly': 'W',
+        'monthly': 'M',
+        'quarterly': 'Q'
+    }
+    return resolution_map.get(resolution, 'D')
+
+def _get_forecast_points_by_resolution(resolution: str, duration: str) -> int:
+    """Calculate number of forecast points based on resolution and duration."""
+    if duration == 'next_7_days':
+        return 7 if resolution == 'daily' else 1
+    elif duration == 'next_30_days':
+        if resolution == 'daily':
+            return 30
+        elif resolution == 'weekly':
+            return 4
+        return 1  # monthly
+    elif duration == 'next_4_months':
+        if resolution == 'daily':
+            return 120
+        elif resolution == 'weekly':
+            return 16
+        elif resolution == 'monthly':
+            return 4
+        return 2  # quarterly
+    elif duration == 'next_12_months':
+        if resolution == 'daily':
+            return 365
+        elif resolution == 'weekly':
+            return 52
+        elif resolution == 'monthly':
+            return 12
+        return 4  # quarterly
+    return 30  # default
+
 async def generate_forecast(
     self,
     db: Session,
@@ -646,33 +687,78 @@ async def generate_forecast(
     duration: str,
     resolution: str
 ) -> Dict[str, Any]:
-    """Generate forecast for a specific metric."""
+    """Generate forecast for a specific metric with exact date handling."""
     try:
-        # Get historical data for the metric
+        today = datetime.now().date()
+        
+        # Get historical data
         historical_data = await self._get_metric_history(
             db=db,
             org_id=org_id,
             metric=metric,
-            lookback_days=365  # Use 1 year of historical data
+            lookback_days=365
         )
 
         if not historical_data:
             raise ValueError("No historical data available for forecasting")
 
+        # Calculate exact end date based on duration
+        if duration == 'next_7_days':
+            end_date = today + timedelta(days=7)
+        elif duration == 'next_30_days':
+            end_date = today + timedelta(days=30)
+        elif duration == 'next_4_months':
+            # Calculate exact days for 4 months from today
+            days_in_4_months = sum(
+                calendar.monthrange(
+                    today.year + ((today.month + i) // 12),
+                    ((today.month + i - 1) % 12) + 1
+                )[1] for i in range(4)
+            )
+            end_date = today + timedelta(days=days_in_4_months)
+        elif duration == 'next_12_months':
+            # Calculate exact days for 12 months
+            days_in_12_months = sum(
+                calendar.monthrange(
+                    today.year + ((today.month + i) // 12),
+                    ((today.month + i - 1) % 12) + 1
+                )[1] for i in range(12)
+            )
+            end_date = today + timedelta(days=days_in_12_months)
+        else:
+            end_date = today + timedelta(days=30)
+
+        # Generate date range based on resolution
+        if resolution == 'daily':
+            dates = pd.date_range(start=today, end=end_date, freq='D')
+        elif resolution == 'weekly':
+            # Generate weekly dates but preserve the start date
+            dates = pd.date_range(start=today, end=end_date + timedelta(days=7), freq='W')
+            dates = dates[dates >= pd.Timestamp(today)]
+            dates = dates[dates <= pd.Timestamp(end_date)]
+        elif resolution == 'monthly':
+            # Generate monthly dates but preserve the start date
+            dates = pd.date_range(start=today, end=end_date + timedelta(days=31), freq='M')
+            dates = dates[dates >= pd.Timestamp(today)]
+            dates = dates[dates <= pd.Timestamp(end_date)]
+        else:  # quarterly
+            # Generate quarterly dates but preserve the start date
+            dates = pd.date_range(start=today, end=end_date + timedelta(days=92), freq='Q')
+            dates = dates[dates >= pd.Timestamp(today)]
+            dates = dates[dates <= pd.Timestamp(end_date)]
+
         # Prepare data for forecasting
         df = pd.DataFrame(historical_data)
         df['ds'] = pd.to_datetime(df['period'])
         df['y'] = df[metric.name]
-
-        # Calculate forecast horizon
-        forecast_days = self._get_forecast_days(duration)
-
+        
         # Generate forecasts using multiple models
+        forecast_points = len(dates)
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = [
-                executor.submit(self._prophet_forecast, df.copy(), forecast_days),
-                executor.submit(self._sarima_forecast, df.copy(), forecast_days),
-                executor.submit(self._exp_smoothing_forecast, df.copy(), forecast_days)
+                executor.submit(self._prophet_forecast, df.copy(), forecast_points),
+                executor.submit(self._sarima_forecast, df.copy(), forecast_points),
+                executor.submit(self._exp_smoothing_forecast, df.copy(), forecast_points)
             ]
 
             forecasts = []
@@ -691,14 +777,6 @@ async def generate_forecast(
 
         # Calculate ensemble forecast
         ensemble_forecast = np.mean(forecasts, axis=0)
-        
-        # Generate forecast dates
-        last_date = pd.to_datetime(df['ds'].iloc[-1])
-        forecast_dates = pd.date_range(
-            start=last_date + pd.Timedelta(days=1),
-            periods=forecast_days,
-            freq='D'
-        )
 
         # Format results
         forecast_results = {
@@ -708,18 +786,21 @@ async def generate_forecast(
                     "date": date.isoformat(),
                     "value": float(value),
                     "confidence_interval": {
-                        "lower": float(value * 0.9),  # Simple confidence interval
+                        "lower": float(value * 0.9),
                         "upper": float(value * 1.1)
                     }
                 }
-                for date, value in zip(forecast_dates, ensemble_forecast)
+                for date, value in zip(dates, ensemble_forecast)
             ],
             "metadata": {
-                "start_date": last_date.isoformat(),
-                "end_date": forecast_dates[-1].isoformat(),
+                "start_date": today.isoformat(),
+                "end_date": end_date.isoformat(),
                 "duration": duration,
                 "resolution": resolution,
-                "model_metrics": metrics
+                "source": metric.connection.name,
+                "model_metrics": metrics,
+                "data_points_used": len(df),
+                "forecast_points": forecast_points
             }
         }
 
@@ -734,11 +815,20 @@ async def get_single_metric_card(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     metric: str = Query(..., description="Metric to display"),
-    scope: str = Query("this_year", description="Data scope (this_week, this_month, this_quarter, this_year)"),
-    resolution: str = Query("monthly", description="Graph data resolution (daily, weekly, monthly, quarterly)")
+    scope: str = Query("past_30_days", description="Data scope"),
+    resolution: str = Query("monthly", description="Data resolution")
 ):
     try:
-        # First try to get metric definition from MetricDefinition
+        # Get date range based on scope
+        start_date, end_date = get_date_range(scope)
+        
+        logger.info(f"""
+        Fetching single metric:
+        Metric: {metric}
+        Date Range: {start_date} to {end_date}
+        Resolution: {resolution}
+        """)
+
         metric_def = db.query(MetricDefinition)\
             .join(DataSourceConnection)\
             .filter(
@@ -747,43 +837,44 @@ async def get_single_metric_card(
                 MetricDefinition.is_active == True
             ).first()
 
-        # Get date range
-        start_date, end_date = get_date_range(scope)
-        
         if metric_def:
-            # Use DynamicAnalysisService for metrics from MetricDefinition
             analysis_service = DynamicAnalysisService()
-            all_metrics = await analysis_service.analyze_metrics(
+            result = await analysis_service.analyze_metrics(
                 db=db,
                 org_id=current_user["current_org_id"],
                 scope=scope,
                 resolution=resolution,
                 forecast=False
             )
-            
-            # Extract the specific metric we want
-            if metric in all_metrics.get("metrics", {}):
-                metric_data = {
-                    "percentage_change": all_metrics["metrics"][metric]["change"]["percentage"],
-                    "start_date": all_metrics["metadata"]["start_date"],
-                    "end_date": all_metrics["metadata"]["end_date"],
-                    "start_amount": all_metrics["metrics"][metric]["previous_value"],
-                    "end_amount": all_metrics["metrics"][metric]["current_value"],
-                    "trend": all_metrics["metrics"][metric].get("trend", "up" if all_metrics["metrics"][metric]["change"]["percentage"] > 0 else "down"),
-                    "graph_data": all_metrics["metrics"][metric].get("trend_data", [])
+
+            if metric not in result.get("metrics", {}):
+                raise HTTPException(status_code=404, detail=f"No data found for metric: {metric}")
+
+            metric_data = result["metrics"][metric]
+            if "trend_data" in metric_data:
+                # Filter trend data to only include points within our date range
+                filtered_trend_data = [
+                    point for point in metric_data["trend_data"]
+                    if start_date.isoformat() <= point["date"] <= end_date.isoformat()
+                ]
+                metric_data["trend_data"] = filtered_trend_data
+
+            response_data = {
+                "scope": scope,
+                "resolution": resolution,
+                "metric": metric,
+                "metric_card": {
+                    "percentage_change": metric_data["change"]["percentage"],
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                    "start_amount": metric_data["previous_value"],
+                    "end_amount": metric_data["current_value"],
+                    "trend": metric_data.get("trend", "up" if metric_data["change"]["percentage"] > 0 else "down"),
+                    "graph_data": metric_data.get("trend_data", [])
                 }
-                
-                return to_json_serializable({
-                    "scope": scope,
-                    "resolution": resolution,
-                    "metric": metric,
-                    "metric_card": metric_data
-                })
-            else:
-                raise HTTPException(
-                    status_code=404, 
-                    detail=f"No data found for metric: {metric}"
-                )
+            }
+
+            return response_data
             
         else:
             # Fallback to WayneEnterprise model for built-in metrics

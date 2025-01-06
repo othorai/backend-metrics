@@ -4,6 +4,9 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import calendar
 import pandas as pd
 import logging
 from app.models.models import DataSourceConnection, MetricDefinition
@@ -19,8 +22,9 @@ logger = logging.getLogger(__name__)
 class DynamicAnalysisService:
     def __init__(self):
         self.cached_schemas = {}
-        self.cache_duration = timedelta(minutes=15)
-        self.cache_timestamp = None
+        self.forecast_cache = {}
+        self.cache_duration = timedelta(hours=1)
+        self.last_cache_cleanup = datetime.now()
 
     async def analyze_data(
         self,
@@ -323,13 +327,17 @@ class DynamicAnalysisService:
                 
         return dimensions
 
+    def _get_cache_key(self, metric_id: int, duration: str, resolution: str) -> str:
+        """Generate a unique cache key for forecast results."""
+        return f"{metric_id}_{duration}_{resolution}"
+
     def _is_cache_valid(self, cache_key: str) -> bool:
-        """Check if cached schema is still valid."""
-        return (
-            cache_key in self.cached_schemas
-            and self.cache_timestamp
-            and datetime.utcnow() - self.cache_timestamp < self.cache_duration
-        )
+        """Check if cached forecast is still valid."""
+        if cache_key not in self.forecast_cache:
+            return False
+        
+        cache_entry = self.forecast_cache[cache_key]
+        return datetime.now() - cache_entry['timestamp'] < self.cache_duration
 
     def _get_connector(self, connection: DataSourceConnection):
         """Get appropriate database connector with proper SSL configuration."""
@@ -362,7 +370,7 @@ class DynamicAnalysisService:
         self,
         db: Session,
         org_id: int,
-        scope: str = "this_year",
+        scope: str = "past_30_days",
         resolution: str = "monthly",
         forecast: bool = False
     ) -> Dict[str, Any]:
@@ -386,121 +394,134 @@ class DynamicAnalysisService:
                 "connection_status": {}
             }
 
+            start_date, end_date = self._get_date_range(scope)
+            metrics_result["metadata"]["start_date"] = start_date.isoformat()
+            metrics_result["metadata"]["end_date"] = end_date.isoformat()
+
             for connection in connections:
                 try:
-                    # Get metrics for this connection
                     metrics = db.query(MetricDefinition).filter(
                         MetricDefinition.connection_id == connection.id,
                         MetricDefinition.is_active == True
                     ).all()
 
-                    # Add metrics definitions to result regardless of data fetch success
+                    # Initialize metrics structure
                     for metric in metrics:
                         metric_key = metric.name.lower().replace(" ", "_")
-                        metrics_result["metrics"][metric_key] = {
-                            "id": metric.id,
-                            "name": metric.name,
-                            "category": metric.category,
-                            "calculation": metric.calculation,
-                            "visualization_type": metric.visualization_type,
-                            "business_context": metric.business_context,
-                            "data_available": False,  # Will be set to True if data fetch succeeds
-                            "source": connection.name
-                        }
+                        metrics_result["metrics"][metric_key] = self._initialize_metric_structure(metric, connection.name)
 
-                    # Try to fetch actual data
-                    try:
-                        connector = self._get_connector(connection)
-                        
-                        # Test connection
-                        test_query = f"SELECT COUNT(*) FROM {connection.table_name}"
-                        result = connector.query(test_query)
-                        logger.info(f"Successfully connected to {connection.name}. Row count: {result}")
+                    # Fetch and process actual data
+                    connector = self._get_connector(connection)
+                    results = await self._fetch_metric_data(
+                        connection=connection,
+                        metrics=metrics,
+                        scope=scope,
+                        resolution=resolution
+                    )
 
-                        # Fetch metric data
-                        results = await self._fetch_metric_data(
-                            connection=connection,
-                            metrics=metrics,
-                            scope=scope,
-                            resolution=resolution
-                        )
+                    if results:
+                        for metric in metrics:
+                            metric_key = metric.name.lower().replace(" ", "_")
+                            metric_data = metrics_result["metrics"][metric_key]
+                            
+                            trend_data = self._process_trend_data(results, metric)
+                            if trend_data:
+                                # Get most recent and previous values for percentage change
+                                current_value = trend_data[0]["value"]
+                                previous_value = trend_data[1]["value"] if len(trend_data) > 1 else current_value
+                                
+                                # Calculate percentage change
+                                if previous_value != 0:
+                                    percentage_change = ((current_value - previous_value) / abs(previous_value)) * 100
+                                else:
+                                    percentage_change = 100 if current_value > 0 else 0
 
-                        if results:
-                            source_metrics = self._process_source_metrics(
-                                results=results,
-                                metrics=metrics,
-                                source_name=connection.name
-                            )
+                                # Update metric data
+                                metric_data.update({
+                                    "current_value": current_value,
+                                    "previous_value": previous_value,
+                                    "change": {
+                                        "absolute": current_value - previous_value,
+                                        "percentage": round(percentage_change, 2)
+                                    },
+                                    "trend": "up" if percentage_change > 0 else "down" if percentage_change < 0 else "stable",
+                                    "trend_data": trend_data,
+                                    "data_available": True
+                                })
 
-                            # Update metrics with actual data
-                            for metric_name, metric_data in source_metrics.items():
-                                metric_key = metric_name.lower().replace(" ", "_")
-                                if metric_key in metrics_result["metrics"]:
-                                    metrics_result["metrics"][metric_key].update({
-                                        "data_available": True,
-                                        "current_value": metric_data.get("current"),
-                                        "previous_value": metric_data.get("previous"),
-                                        "change": {
-                                            "absolute": metric_data.get("current", 0) - metric_data.get("previous", 0),
-                                            "percentage": self._calculate_percentage_change(
-                                                metric_data.get("current", 0),
-                                                metric_data.get("previous", 0)
-                                            )
-                                        },
-                                        "trend_data": metric_data.get("trend_data", []),
-                                        "dimensions": metric_data.get("dimensions", {})
-                                    })
+                    metrics_result["sources"].append({
+                        "name": connection.name,
+                        "type": connection.source_type,
+                        "metrics_count": len(metrics)
+                    })
 
-                            # Add source status
-                            metrics_result["connection_status"][connection.name] = {
-                                "status": "connected",
-                                "message": "Successfully connected and fetched data"
-                            }
-
-                        metrics_result["sources"].append({
-                            "name": connection.name,
-                            "type": connection.source_type,
-                            "metrics_count": len(metrics)
-                        })
-
-                    except Exception as e:
-                        logger.error(f"Error fetching data from {connection.name}: {str(e)}")
-                        metrics_result["connection_status"][connection.name] = {
-                            "status": "error",
-                            "message": str(e)
-                        }
-                    finally:
-                        if 'connector' in locals() and connector:
-                            connector.disconnect()
+                    metrics_result["connection_status"][connection.name] = {
+                        "status": "connected",
+                        "message": "Successfully connected and fetched data"
+                    }
 
                 except Exception as e:
                     logger.error(f"Error processing connection {connection.name}: {str(e)}")
-                    continue
-
-            # Set date range in metadata
-            start_date, end_date = self._get_date_range(scope)
-            metrics_result["metadata"]["start_date"] = start_date.isoformat()
-            metrics_result["metadata"]["end_date"] = end_date.isoformat()
+                    metrics_result["connection_status"][connection.name] = {
+                        "status": "error",
+                        "message": str(e)
+                    }
 
             return metrics_result
 
         except Exception as e:
             logger.error(f"Error in analyze_metrics: {str(e)}")
-            start_date, end_date = self._get_date_range(scope)
-            return {
-                "metadata": {
-                    "scope": scope,
-                    "resolution": resolution,
-                    "organization_id": org_id,
-                    "start_date": start_date.isoformat(),
-                    "end_date": end_date.isoformat()
-                },
-                "metrics": {},
-                "sources": [],
-                "connection_status": {
-                    "error": str(e)
-                }
-            }
+            raise
+
+    def _initialize_metric_structure(self, metric: MetricDefinition, source_name: str) -> Dict[str, Any]:
+        """Initialize the basic structure for a metric."""
+        return {
+            "id": metric.id,
+            "name": metric.name,
+            "category": metric.category,
+            "calculation": metric.calculation,
+            "visualization_type": metric.visualization_type,
+            "business_context": metric.business_context,
+            "data_available": False,
+            "source": source_name,
+            "current_value": 0,
+            "previous_value": 0,
+            "change": {
+                "absolute": 0,
+                "percentage": 0
+            },
+            "trend": "stable",
+            "trend_data": [],
+            "dimensions": {}
+        }
+    
+    def _process_trend_data(self, results: List[Dict[str, Any]], metric: MetricDefinition) -> List[Dict[str, Any]]:
+        """Process and format trend data for a metric."""
+        try:
+            metric_key = metric.name.lower().replace(" ", "_")
+            trend_data = []
+            
+            # Convert results to DataFrame for easier processing
+            df = pd.DataFrame(results)
+            if df.empty or metric_key not in df.columns:
+                return []
+
+            # Sort by period in descending order (most recent first)
+            df = df.sort_values('period', ascending=False)
+            
+            for _, row in df.iterrows():
+                if pd.notnull(row[metric_key]) and pd.notnull(row['period']):
+                    trend_data.append({
+                        "date": row['period'].isoformat(),
+                        "value": float(row[metric_key])
+                    })
+
+            return trend_data
+
+        except Exception as e:
+            logger.error(f"Error processing trend data for {metric.name}: {str(e)}")
+            return []
+    
 
     def _get_date_trunc_unit(self, resolution: str, database_type: str) -> str:
         """
@@ -715,17 +736,7 @@ class DynamicAnalysisService:
                     metric_key = metric.name.lower().replace(' ', '_')
 
                     if not df.empty and metric_key in df.columns:
-                        current_value = float(df[metric_key].iloc[0]) if not pd.isna(df[metric_key].iloc[0]) else 0
-                        previous_value = float(df[metric_key].iloc[1]) if len(df) > 1 and not pd.isna(df[metric_key].iloc[1]) else 0
-                        
-                        # Calculate changes
-                        absolute_change = current_value - previous_value
-                        percentage_change = (
-                            (absolute_change / previous_value * 100)
-                            if previous_value != 0 else 0
-                        )
-
-                        # Format trend data
+                        # Create trend data first
                         trend_data = []
                         for _, row in df.iterrows():
                             if pd.notnull(row[metric_key]) and pd.notnull(row['period']):
@@ -733,6 +744,20 @@ class DynamicAnalysisService:
                                     "date": row['period'].isoformat() if hasattr(row['period'], 'isoformat') else row['period'],
                                     "value": float(row[metric_key])
                                 })
+                        
+                        # Sort trend data by date
+                        trend_data.sort(key=lambda x: x["date"], reverse=True)
+                        
+                        # Get current and previous values from trend data
+                        current_value = float(trend_data[0]["value"]) if trend_data else 0
+                        previous_value = float(trend_data[1]["value"]) if len(trend_data) > 1 else 0
+                        
+                        # Calculate changes
+                        absolute_change = current_value - previous_value
+                        percentage_change = (
+                            (absolute_change / previous_value * 100)
+                            if previous_value != 0 else 0
+                        )
 
                         processed_metrics[metric.name] = {
                             "id": metric.id,
@@ -912,7 +937,125 @@ class DynamicAnalysisService:
             end_date = start_date + pd.DateOffset(months=1) - pd.Timedelta(days=1)
             return start_date, end_date
 
-    def generate_forecast(
+    def _get_frequency_by_resolution(resolution: str) -> str:
+        """Get pandas frequency string based on resolution."""
+        resolution_map = {
+            'daily': 'D',
+            'weekly': 'W',
+            'monthly': 'M',
+            'quarterly': 'Q'
+        }
+        return resolution_map.get(resolution, 'D')
+
+    def _get_forecast_points_by_resolution(self, resolution: str, duration: str) -> int:
+        """Calculate number of forecast points based on resolution and duration."""
+        if duration == 'next_7_days':
+            return 7 if resolution == 'daily' else 1
+        elif duration == 'next_30_days':
+            if resolution == 'daily':
+                return 30
+            elif resolution == 'weekly':
+                return 4
+            return 1  # monthly
+        elif duration == 'next_4_months':
+            if resolution == 'daily':
+                return 120
+            elif resolution == 'weekly':
+                return 16
+            elif resolution == 'monthly':
+                return 4
+            return 2  # quarterly
+        elif duration == 'next_12_months':
+            if resolution == 'daily':
+                return 365
+            elif resolution == 'weekly':
+                return 52
+            elif resolution == 'monthly':
+                return 12
+            return 4  # quarterly
+        return 30  # default
+
+    def _calculate_end_date(self, today: datetime.date, duration: str) -> datetime.date:
+        """Calculate the end date based on duration."""
+        if duration == 'next_7_days':
+            return today + timedelta(days=7)
+        elif duration == 'next_30_days':
+            return today + timedelta(days=30)
+        elif duration == 'next_4_months':
+            days_in_4_months = sum(
+                calendar.monthrange(
+                    today.year + ((today.month + i) // 12),
+                    ((today.month + i - 1) % 12) + 1
+                )[1] for i in range(4)
+            )
+            return today + timedelta(days=days_in_4_months)
+        elif duration == 'next_12_months':
+            days_in_12_months = sum(
+                calendar.monthrange(
+                    today.year + ((today.month + i) // 12),
+                    ((today.month + i - 1) % 12) + 1
+                )[1] for i in range(12)
+            )
+            return today + timedelta(days=days_in_12_months)
+        return today + timedelta(days=30)
+
+    def _generate_date_range(self, start_date: datetime.date, end_date: datetime.date, resolution: str) -> pd.DatetimeIndex:
+        """Generate date range based on resolution."""
+        if resolution == 'daily':
+            return pd.date_range(start=start_date, end=end_date, freq='D')
+        elif resolution == 'weekly':
+            dates = pd.date_range(start=start_date, end=end_date + timedelta(days=7), freq='W')
+            return dates[(dates >= pd.Timestamp(start_date)) & (dates <= pd.Timestamp(end_date))]
+        elif resolution == 'monthly':
+            dates = pd.date_range(start=start_date, end=end_date + timedelta(days=31), freq='M')
+            return dates[(dates >= pd.Timestamp(start_date)) & (dates <= pd.Timestamp(end_date))]
+        else:  # quarterly
+            dates = pd.date_range(start=start_date, end=end_date + timedelta(days=92), freq='Q')
+            return dates[(dates >= pd.Timestamp(start_date)) & (dates <= pd.Timestamp(end_date))]
+
+    def _format_forecast_results(
+        self,
+        last_date: pd.Timestamp,
+        forecast_dates: pd.DatetimeIndex,
+        forecast_values: np.ndarray,
+        metrics: Dict[str, float],
+        model_type: str
+    ) -> Dict[str, Any]:
+        """Format forecast results with confidence intervals."""
+        # Calculate confidence intervals based on historical accuracy
+        confidence_multiplier = 1.96  # 95% confidence interval
+        prediction_std = np.std(forecast_values) if len(forecast_values) > 1 else forecast_values[0] * 0.1
+        
+        return {
+            "forecast_points": [
+                {
+                    "date": date.isoformat(),
+                    "value": float(value),
+                    "confidence_interval": {
+                        "lower": float(value - confidence_multiplier * prediction_std),
+                        "upper": float(value + confidence_multiplier * prediction_std)
+                    }
+                }
+                for date, value in zip(forecast_dates, forecast_values)
+                if not (math.isnan(value) or math.isinf(value))
+            ],
+            "metadata": {
+                "model_type": model_type,
+                "metrics": metrics,
+                "forecast_quality": self._assess_forecast_quality(metrics)
+            }
+        }
+
+    def _assess_forecast_quality(self, metrics: Dict[str, float]) -> str:
+        """Assess forecast quality based on error metrics."""
+        if metrics.get('mape', 100) < 10:
+            return 'high'
+        elif metrics.get('mape', 100) < 20:
+            return 'medium'
+        else:
+            return 'low'
+
+    async def generate_forecast(
         self,
         db: Session,
         org_id: int,
@@ -920,104 +1063,189 @@ class DynamicAnalysisService:
         duration: str,
         resolution: str
     ) -> Dict[str, Any]:
-        """Generate forecast for a specific metric."""
+        """Optimized forecast generation with caching and selective model usage."""
         try:
-            # Get historical data and prepare DataFrame
-            historical_data = self._get_metric_history(
+            cache_key = self._get_cache_key(metric.id, duration, resolution)
+            
+            # Check cache first
+            if self._is_cache_valid(cache_key):
+                return self.forecast_cache[cache_key]['data']
+
+            # Clean up old cache entries periodically
+            if datetime.now() - self.last_cache_cleanup > timedelta(hours=1):
+                self._cleanup_cache()
+
+            # Get historical data efficiently
+            historical_data = await self._get_metric_history(
                 db=db,
                 org_id=org_id,
                 metric=metric,
-                lookback_days=365
+                lookback_days=365  # Adjust based on duration
             )
 
             if not historical_data:
                 raise ValueError("No historical data available for forecasting")
 
-            df = pd.DataFrame(historical_data, columns=['period', 'value'])
-            df['value'] = pd.to_numeric(df['value'], errors='coerce')
-            df = df.dropna()
-            df = df.sort_values('period').reset_index(drop=True)
-            df['ds'] = pd.to_datetime(df['period']).dt.tz_localize(None)
-            df['y'] = df['value']
+            # Prepare data more efficiently
+            df = pd.DataFrame(historical_data)
+            df['ds'] = pd.to_datetime(df['period'])
+            df['y'] = df[metric.name]
 
-            # Get forecast period
-            forecast_start, forecast_end = self._get_forecast_period(duration)
+            # Calculate forecast points based on resolution
+            forecast_points = self._get_forecast_points_by_resolution(resolution, duration)
+
+            # Select best model based on data characteristics
+            model_choice = self._select_best_model(df)
             
-            # Generate date range based on resolution
-            freq_map = {
-                'daily': 'D',
-                'weekly': 'W',
-                'monthly': 'MS',  # Month Start
-                'quarterly': 'QS'  # Quarter Start
-            }
-            freq = freq_map.get(resolution, 'D')
-            
-            forecast_dates = pd.date_range(
-                start=forecast_start,
-                end=forecast_end,
-                freq=freq
+            # Generate forecast using only the selected model
+            forecast_result = await self._generate_optimized_forecast(
+                df,
+                forecast_points,
+                model_choice
             )
-            
-            forecast_horizon = len(forecast_dates)
 
-            # Generate forecasts using multiple models
+            # Cache the results
+            self.forecast_cache[cache_key] = {
+                'data': forecast_result,
+                'timestamp': datetime.now()
+            }
+
+            return forecast_result
+
+        except Exception as e:
+            logger.error(f"Error generating forecast: {str(e)}")
+            raise
+
+    def _select_best_model(self, df: pd.DataFrame) -> str:
+        """Select the most appropriate forecasting model based on data characteristics."""
+        try:
+            # Check data characteristics
+            data_length = len(df)
+            has_seasonality = self._check_quick_seasonality(df['y'].values)
+            is_stationary = self._check_stationarity(df['y'].values)
+            
+            # Decision logic for model selection
+            if data_length < 30:
+                return 'exp_smoothing'  # Use simpler model for short series
+            elif has_seasonality and data_length >= 60:
+                return 'prophet'  # Prophet handles seasonality well
+            elif is_stationary:
+                return 'sarima'  # SARIMA works well with stationary data
+            else:
+                return 'exp_smoothing'  # Default to simpler model
+                
+        except Exception:
+            return 'exp_smoothing'  # Default to simplest model on error
+
+    def _check_quick_seasonality(self, values: np.ndarray) -> bool:
+        """Quickly check for obvious seasonality patterns."""
+        if len(values) < 14:
+            return False
+            
+        # Check weekly correlation (faster than full seasonality check)
+        weekly_diff = np.correlate(values[7:], values[:-7], mode='valid')
+        return bool(np.max(np.abs(weekly_diff)) > 0.7)
+
+    def _check_stationarity(self, values: np.ndarray) -> bool:
+        """Quick check for stationarity using rolling statistics."""
+        if len(values) < 10:
+            return True
+            
+        rolling_mean = pd.Series(values).rolling(window=3).mean()
+        rolling_std = pd.Series(values).rolling(window=3).std()
+        
+        return (rolling_mean.std() < values.std() * 0.1 and 
+                rolling_std.std() < values.std() * 0.1)
+
+    async def _generate_optimized_forecast(
+        self,
+        df: pd.DataFrame,
+        forecast_horizon: int,
+        model_choice: str
+    ) -> Dict[str, Any]:
+        """Generate forecast using the selected model."""
+        try:
+            loop = asyncio.get_event_loop()
+            
+            if model_choice == 'prophet':
+                forecast_func = self._prophet_forecast
+            elif model_choice == 'sarima':
+                forecast_func = self._sarima_forecast
+            else:
+                forecast_func = self._exp_smoothing_forecast
+            
+            # Run the selected model in a thread pool
+            forecast_values, metrics = await loop.run_in_executor(
+                None,
+                lambda: forecast_func(df.copy(), forecast_horizon)
+            )
+
+            if forecast_values is None:
+                raise ValueError(f"Forecast failed for {model_choice}")
+
+            # Ensure the index is a DatetimeIndex
+            df = df.reset_index()
+            if 'ds' not in df.columns and 'period' in df.columns:
+                df = df.rename(columns={'period': 'ds'})
+            
+            # Get the last date, ensuring it's a Timestamp
+            last_date = pd.Timestamp(df['ds'].max())
+
+            # Create forecast dates
+            forecast_dates = pd.date_range(
+                start=last_date + pd.Timedelta(days=1),
+                periods=forecast_horizon,
+                freq='D'
+            )
+
+            # Format results
+            return self._format_forecast_results(
+                last_date,  # Last date
+                forecast_dates,
+                forecast_values,
+                metrics,
+                model_choice
+            )
+
+        except Exception as e:
+            logger.error(f"Error in optimized forecast: {str(e)}")
+            raise
+
+    def _cleanup_cache(self):
+        """Remove expired entries from forecast cache."""
+        current_time = datetime.now()
+        self.forecast_cache = {
+            k: v for k, v in self.forecast_cache.items()
+            if current_time - v['timestamp'] < self.cache_duration
+        }
+        self.last_cache_cleanup = current_time
+
+
+    def _run_forecasting_models(self, df: pd.DataFrame, forecast_horizon: int) -> Tuple[np.ndarray, Dict[str, Dict[str, float]]]:
+        """Run all forecasting models in parallel and return ensemble results."""
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(self._prophet_forecast, df.copy(), forecast_horizon),
+                executor.submit(self._sarima_forecast, df.copy(), forecast_horizon),
+                executor.submit(self._exp_smoothing_forecast, df.copy(), forecast_horizon)
+            ]
+
             forecasts = []
             metrics = {}
-
-            # Prophet forecast
-            try:
-                prophet_values, prophet_metrics = self._prophet_forecast(df.copy(), forecast_horizon)
-                if prophet_values is not None:
-                    # Resample prophet values to match desired frequency
-                    prophet_df = pd.DataFrame({
-                        'ds': forecast_dates,
-                        'y': prophet_values[:forecast_horizon]
-                    })
-                    forecasts.append(prophet_df['y'].values)
-                    metrics['prophet'] = prophet_metrics
-            except Exception as e:
-                logger.error(f"Prophet forecast failed: {str(e)}")
-
-            # Add other models similarly...
+            for future, method in zip(as_completed(futures), ['prophet', 'sarima', 'exp_smoothing']):
+                try:
+                    forecast, forecast_metrics = future.result()
+                    if forecast is not None:
+                        forecasts.append(forecast)
+                        metrics[method] = forecast_metrics
+                except Exception as e:
+                    logger.error(f"Error in {method} forecast: {str(e)}")
 
             if not forecasts:
                 raise ValueError("All forecasting methods failed")
 
-            # Calculate ensemble forecast
             ensemble_forecast = np.mean(forecasts, axis=0)
-
-            # Format forecast data
-            forecast_data = {
-                "metric_name": metric.name,
-                "forecast_points": [
-                    {
-                        "date": date.isoformat(),
-                        "value": float(value),
-                        "confidence_interval": {
-                            "lower": float(value * 0.9),
-                            "upper": float(value * 1.1)
-                        }
-                    }
-                    for date, value in zip(forecast_dates, ensemble_forecast)
-                    if not (math.isnan(value) or math.isinf(value))
-                ],
-                "metadata": {
-                    "start_date": forecast_start.isoformat(),
-                    "end_date": forecast_end.isoformat(),
-                    "duration": duration,
-                    "resolution": resolution,
-                    "source": metric.connection.name,
-                    "model_metrics": metrics,
-                    "data_points_used": len(df),
-                    "forecast_points": len(forecast_dates)
-                }
-            }
-
-            return forecast_data
-
-        except Exception as e:
-            logger.error(f"Error generating forecast: {str(e)}", exc_info=True)
-            raise
+            return ensemble_forecast, metrics
 
     def _prophet_forecast(self, df: pd.DataFrame, forecast_horizon: int) -> Tuple[np.ndarray, Dict[str, float]]:
         """Generate forecast using Prophet."""
@@ -1428,68 +1656,31 @@ class DynamicAnalysisService:
             raise
 
     def _get_date_range(self, scope: str) -> tuple:
-        """
-        Get date range based on scope.
-        Args:
-            scope: one of ["this_week", "this_month", "this_quarter", "this_year"]
-        Returns:
-            tuple of (start_date, end_date)
-        """
+        """Calculate rolling date range based on scope."""
         today = datetime.now().date()
         
-        if scope == "this_week":
-            # Start from Monday of current week
-            start_date = today - timedelta(days=today.weekday())
-            end_date = today
-            
-        elif scope == "this_month":
-            # Start from first day of current month
-            start_date = today.replace(day=1)
-            end_date = today
-            
-        elif scope == "this_quarter":
-            # Start from first day of current quarter
-            quarter = (today.month - 1) // 3
-            start_date = today.replace(
-                month=3 * quarter + 1,
-                day=1
-            )
-            end_date = today
-            
-        elif scope == "last_month":
-            # Last month's date range
-            if today.month == 1:
-                start_date = today.replace(year=today.year-1, month=12, day=1)
-            else:
-                start_date = today.replace(month=today.month-1, day=1)
-            end_date = today.replace(day=1) - timedelta(days=1)
-            
-        elif scope == "last_quarter":
-            # Last quarter's date range
-            quarter = (today.month - 1) // 3
-            if quarter == 0:
-                start_date = today.replace(year=today.year-1, month=10, day=1)
-                end_date = today.replace(year=today.year-1, month=12, day=31)
-            else:
-                start_date = today.replace(month=3 * (quarter - 1) + 1, day=1)
-                end_date = today.replace(month=3 * quarter, day=1) - timedelta(days=1)
-                
-        elif scope == "last_year":
-            # Last year's date range
-            start_date = today.replace(year=today.year-1, month=1, day=1)
-            end_date = today.replace(year=today.year-1, month=12, day=31)
-            
-        elif scope == "ytd" or scope == "this_year":
-            # Year to date
-            start_date = today.replace(month=1, day=1)
-            end_date = today
-            
-        else:
-            # Default to last 30 days if scope not recognized
+        if scope == 'past_7_days':
+            start_date = today - timedelta(days=7)
+        elif scope == 'past_30_days':
             start_date = today - timedelta(days=30)
-            end_date = today
-
-        return start_date, end_date
+        elif scope == 'past_4_months':
+            # Calculate start date as 4 months ago from today
+            year = today.year
+            month = today.month - 4  # Go back 4 months
+            
+            # Handle year boundary
+            if month <= 0:
+                month = 12 + month
+                year -= 1
+                
+            start_date = datetime(year, month, today.day).date()
+        elif scope == 'past_12_months':
+            # Calculate start date as 12 months ago from today
+            start_date = today.replace(year=today.year - 1)
+        else:  # Default to past 30 days
+            start_date = today - timedelta(days=30)
+        
+        return start_date, today
 
     def _get_comparison_date_range(self, scope: str, start_date: datetime.date) -> tuple:
         """
@@ -2166,67 +2357,57 @@ class DynamicAnalysisService:
             logger.error(f"Error calculating dimension statistics: {str(e)}")
             return {}
         
-    def _get_metric_history(
+    async def _get_metric_history(
         self,
         db: Session,
         org_id: int,
         metric: MetricDefinition,
         lookback_days: int = 365
     ) -> List[Dict[str, Any]]:
-        """Get historical data for a specific metric."""
+        """Get historical metric data with proper async handling."""
         try:
-            # Get connection details
             connection = db.query(DataSourceConnection).get(metric.connection_id)
             if not connection:
                 raise ValueError(f"Connection not found for metric {metric.name}")
 
-            # Calculate date range
             end_date = datetime.now().date()
             start_date = end_date - timedelta(days=lookback_days)
 
-            # Build query with metric calculation
             period_expression = self._build_date_trunc_expression(
                 connection.date_column,
                 'daily',
                 connection.source_type
             )
 
-            # Modify the query to output lowercase column names
+            # Use metric name as column name
             query = f"""
             WITH metric_data AS (
                 SELECT 
                     {period_expression}::date as period,
-                    CAST({metric.calculation} AS FLOAT) as value
+                    CAST({metric.calculation} AS FLOAT) as {metric.name}
                 FROM {connection.table_name}
                 WHERE {connection.date_column} BETWEEN '{start_date}' AND '{end_date}'
                 GROUP BY period
             )
-            SELECT period, value 
+            SELECT period, {metric.name}
             FROM metric_data
-            WHERE value IS NOT NULL
+            WHERE {metric.name} IS NOT NULL
             ORDER BY period ASC
             """
 
-            # Execute query
+            # Use asyncio to run the database query in a thread pool
+            loop = asyncio.get_event_loop()
             connector = self._get_connector(connection)
             try:
-                results = connector.query(query)
+                results = await loop.run_in_executor(
+                    None, 
+                    lambda: connector.query(query)
+                )
+                
                 logger.info(f"Query returned {len(results)} rows")
                 if results:
-                    sample = results[0]
-                    logger.info(f"Sample result: {sample}")
-
-                processed_results = []
-                for row in results:
-                    # Convert dictionary keys to lowercase
-                    processed_row = {
-                        'period': row.get('PERIOD', row.get('period')),
-                        'value': row.get('VALUE', row.get('value'))
-                    }
-                    processed_results.append(processed_row)
-
-                return processed_results
-
+                    logger.info(f"Sample result: {results[0]}")
+                return results
             finally:
                 connector.disconnect()
 
