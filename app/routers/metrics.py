@@ -6,6 +6,7 @@ from app.models.models import WayneEnterprise
 import pandas as pd
 import numpy as np
 import calendar
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple, Union, Any
 from sqlalchemy import func
@@ -551,7 +552,7 @@ async def get_bulk_forecast(
         )
 
 @router.get("/available_forecast_metrics")
-def get_forecastable_metrics(
+async def get_forecastable_metrics(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
@@ -573,19 +574,21 @@ def get_forecastable_metrics(
         )
 
         # Further filter metrics based on calculation and data dependencies
-        forecastable_metrics = []
         analysis_service = DynamicAnalysisService()
         
-        for metric in metrics:
-            # Check if metric has sufficient historical data for forecasting
-            historical_data = analysis_service._get_metric_history(
+        forecastable_metrics = []
+        
+        # Use asyncio to run historical data checks concurrently
+        async def check_metric(metric):
+            # Check historical data length
+            historical_data_length = await analysis_service._get_metric_history(
                 db=db,
                 org_id=current_user["current_org_id"],
                 metric=metric,
-                lookback_days=90  # Minimum data points needed for forecasting
+                lookback_days=365
             )
 
-            if historical_data and len(historical_data) >= 30:  # Minimum number of data points
+            if len(historical_data_length) >= 30:  # Minimum number of data points
                 # Verify the metric calculation involves numeric operations
                 calculation = metric.calculation.lower()
                 numeric_indicators = ['sum', 'avg', 'count', 'min', 'max', 'mean', 'median']
@@ -595,13 +598,22 @@ def get_forecastable_metrics(
                     confidence_score = metric.confidence_score or 0.5  # Default confidence if None
                     
                     # Add additional confidence based on data quality and quantity
-                    if len(historical_data) > 180:  # More historical data increases confidence
+                    if len(historical_data_length) > 180:  # More historical data increases confidence
                         confidence_score += 0.2
                     if metric.aggregation_period.lower() in ['daily', 'weekly', 'monthly']:
                         confidence_score += 0.1
                         
                     metric.confidence_score = min(confidence_score, 1.0)  # Cap at 1.0
-                    forecastable_metrics.append(metric)
+                    return metric
+
+            return None
+
+        # Run checks concurrently
+        tasks = [check_metric(metric) for metric in metrics]
+        results = await asyncio.gather(*tasks)
+        
+        # Filter out None results (metrics that didn't pass checks)
+        forecastable_metrics = [metric for metric in results if metric is not None]
 
         # Organize metrics by category
         categorized_metrics = {}

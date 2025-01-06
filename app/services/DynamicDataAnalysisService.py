@@ -4,6 +4,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from fastapi import APIRouter, Depends, HTTPException, Query
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import calendar
@@ -1163,54 +1164,166 @@ class DynamicAnalysisService:
         forecast_horizon: int,
         model_choice: str
     ) -> Dict[str, Any]:
-        """Generate forecast using the selected model."""
+            """Generate forecast using the selected model."""
+            try:
+                loop = asyncio.get_event_loop()
+                
+                if model_choice == 'prophet':
+                    forecast_func = self._prophet_forecast
+                elif model_choice == 'sarima':
+                    forecast_func = self._sarima_forecast
+                else:
+                    forecast_func = self._exp_smoothing_forecast
+                
+                # Run the selected model in a thread pool
+                forecast_values, metrics = await loop.run_in_executor(
+                    None,
+                    lambda: forecast_func(df.copy(), forecast_horizon)
+                )
+
+                if forecast_values is None:
+                    raise ValueError(f"Forecast failed for {model_choice}")
+
+                # Ensure the index is a DatetimeIndex
+                df = df.reset_index()
+                if 'ds' not in df.columns and 'period' in df.columns:
+                    df = df.rename(columns={'period': 'ds'})
+                
+                # Convert ds column to datetime if it's not already
+                df['ds'] = pd.to_datetime(df['ds'])
+                
+                # Get the last date, ensuring it's a Timestamp
+                last_date = pd.Timestamp(df['ds'].max())
+
+                # Create forecast dates using the last date + increments
+                forecast_dates = pd.date_range(
+                    start=last_date + pd.Timedelta(days=1),
+                    periods=forecast_horizon,
+                    freq='D'
+                )
+
+                # Format results
+                return self._format_forecast_results(
+                    last_date,  # Last date
+                    forecast_dates,
+                    forecast_values,
+                    metrics,
+                    model_choice
+                )
+
+            except Exception as e:
+                logger.error(f"Error in optimized forecast: {str(e)}")
+                raise
+        
+    def _get_historical_data_length(
+        self,
+        db: Session,
+        org_id: int,
+        metric: MetricDefinition
+    ) -> int:
+        """Get the number of historical data points."""
         try:
-            loop = asyncio.get_event_loop()
-            
-            if model_choice == 'prophet':
-                forecast_func = self._prophet_forecast
-            elif model_choice == 'sarima':
-                forecast_func = self._sarima_forecast
-            else:
-                forecast_func = self._exp_smoothing_forecast
-            
-            # Run the selected model in a thread pool
-            forecast_values, metrics = await loop.run_in_executor(
-                None,
-                lambda: forecast_func(df.copy(), forecast_horizon)
+            historical_data = self._get_metric_history(
+                db=db,
+                org_id=org_id,
+                metric=metric,
+                lookback_days=90  # Minimum data points needed for forecasting
+            )
+            # Wait for the coroutine to complete
+            return len(historical_data)
+        except Exception as e:
+            logger.error(f"Error getting historical data length for {metric.name}: {str(e)}")
+            return 0
+
+    def get_forecastable_metrics(
+        db: Session,
+        current_user: dict
+    ) -> Dict[str, Any]:
+        """Get all metrics that are suitable for forecasting."""
+        try:
+            # Get metrics that have appropriate types for forecasting
+            metrics = (
+                db.query(MetricDefinition)
+                .join(DataSourceConnection)
+                .filter(
+                    DataSourceConnection.organization_id == current_user["current_org_id"],
+                    MetricDefinition.is_active == True,
+                    MetricDefinition.visualization_type.in_([
+                        'line_chart', 'line', 'bar_chart', 'bar', 'area_chart', 'area',
+                        'Line Chart', 'Bar Chart', 'Area Chart'
+                    ])
+                )
+                .all()
             )
 
-            if forecast_values is None:
-                raise ValueError(f"Forecast failed for {model_choice}")
-
-            # Ensure the index is a DatetimeIndex
-            df = df.reset_index()
-            if 'ds' not in df.columns and 'period' in df.columns:
-                df = df.rename(columns={'period': 'ds'})
+            # Further filter metrics based on calculation and data dependencies
+            analysis_service = DynamicAnalysisService()
             
-            # Get the last date, ensuring it's a Timestamp
-            last_date = pd.Timestamp(df['ds'].max())
+            forecastable_metrics = []
+            
+            for metric in metrics:
+                # Check historical data length
+                historical_data_length = self._get_historical_data_length(
+                    db=db,
+                    org_id=current_user["current_org_id"],
+                    metric=metric
+                )
 
-            # Create forecast dates
-            forecast_dates = pd.date_range(
-                start=last_date + pd.Timedelta(days=1),
-                periods=forecast_horizon,
-                freq='D'
-            )
+                if historical_data_length >= 30:  # Minimum number of data points
+                    # Verify the metric calculation involves numeric operations
+                    calculation = metric.calculation.lower()
+                    numeric_indicators = ['sum', 'avg', 'count', 'min', 'max', 'mean', 'median']
+                    
+                    # Check if the calculation involves numeric operations
+                    if any(indicator in calculation for indicator in numeric_indicators):
+                        confidence_score = metric.confidence_score or 0.5  # Default confidence if None
+                        
+                        # Add additional confidence based on data quality and quantity
+                        if historical_data_length > 180:  # More historical data increases confidence
+                            confidence_score += 0.2
+                        if metric.aggregation_period.lower() in ['daily', 'weekly', 'monthly']:
+                            confidence_score += 0.1
+                            
+                        metric.confidence_score = min(confidence_score, 1.0)  # Cap at 1.0
+                        forecastable_metrics.append(metric)
 
-            # Format results
-            return self._format_forecast_results(
-                last_date,  # Last date
-                forecast_dates,
-                forecast_values,
-                metrics,
-                model_choice
-            )
+            # Organize metrics by category
+            categorized_metrics = {}
+            for metric in forecastable_metrics:
+                if metric.category not in categorized_metrics:
+                    categorized_metrics[metric.category] = []
+
+                categorized_metrics[metric.category].append({
+                    "id": metric.id,
+                    "name": metric.name,
+                    "visualization_type": metric.visualization_type,
+                    "business_context": metric.business_context,
+                    "source": metric.connection.name,
+                    "confidence_score": metric.confidence_score,
+                    "calculation": metric.calculation,
+                    "aggregation_period": metric.aggregation_period,
+                    "forecast_settings": {
+                        "min_historical_days": 30,
+                        "recommended_forecast_period": metric.aggregation_period,
+                        "max_forecast_horizon": 90  # days
+                    }
+                })
+
+            # Only include categories that have metrics
+            filtered_categories = [cat for cat in categorized_metrics.keys() if categorized_metrics[cat]]
+
+            return {
+                "categories": filtered_categories,
+                "metrics": categorized_metrics
+            }
 
         except Exception as e:
-            logger.error(f"Error in optimized forecast: {str(e)}")
-            raise
-
+            logger.error(f"Error getting forecastable metrics: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error retrieving metrics: {str(e)}"
+            )
+    
     def _cleanup_cache(self):
         """Remove expired entries from forecast cache."""
         current_time = datetime.now()
