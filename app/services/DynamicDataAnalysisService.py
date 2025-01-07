@@ -615,10 +615,19 @@ class DynamicAnalysisService:
         metric_calculations = []
         for metric in metrics:
             calc = self._sanitize_calculation(metric.calculation, {})
-            # Use snake_case for alias names to avoid SQL errors
-            safe_alias = metric.name.lower().replace(' ', '_')
+            # Use SQL-safe names for alias
+            safe_alias = self._format_column_name(metric.name)
             metric_calculations.append(f"{calc} as {safe_alias}")
         return metric_calculations
+
+    def _format_column_name(self, name: str) -> str:
+        """Format column name to be SQL-safe."""
+        # Replace spaces, periods, and other special characters with underscores
+        safe_name = name.lower().replace(' ', '_').replace('.', '_').replace('-', '_')
+        # Remove any duplicate underscores
+        safe_name = '_'.join(filter(None, safe_name.split('_')))
+        return safe_name
+
 
     async def _fetch_metric_data(
         self,
@@ -633,10 +642,10 @@ class DynamicAnalysisService:
             start_date, end_date = self._get_date_range(scope)
             logger.info(f"Fetching data for period: {start_date} to {end_date}")
 
-            # Build metric calculations
+            # Build metric calculations with safe column names
             metric_calculations = []
             for metric in metrics:
-                safe_name = metric.name.lower().replace(' ', '_')
+                safe_name = self._format_column_name(metric.name)
                 metric_calculations.append(f"{metric.calculation} as {safe_name}")
 
             # Build date truncation expression
@@ -665,8 +674,6 @@ class DynamicAnalysisService:
             try:
                 results = connector.query(query, (start_date, end_date))
                 logger.info(f"Query returned {len(results)} rows")
-                if results:
-                    logger.info(f"Sample result: {results[0]}")
                 return results
             finally:
                 connector.disconnect()
@@ -809,26 +816,19 @@ class DynamicAnalysisService:
 
 
 
-    def _build_metrics_query(
-        self,
-        table_name: str,
-        date_column: str,
-        metrics: List[MetricDefinition],
-        schema: Dict[str, Dict],
-        start_date: datetime,
-        end_date: datetime,
-        resolution: str
-    ) -> str:
+    def _build_metrics_query(self, table_name: str, date_column: str, metrics: List[MetricDefinition], schema: Dict[str, Dict], start_date: datetime, end_date: datetime, resolution: str) -> str:
         """Build SQL query for metrics analysis."""
         try:
             # Get date truncation based on resolution
             date_trunc = self._get_date_trunc(resolution, date_column)
             
-            # Process metrics calculations
+            # Process metrics calculations - Use snake_case for column names
             metric_calculations = []
             for metric in metrics:
                 calc = self._sanitize_calculation(metric.calculation, schema)
-                metric_calculations.append(f"{calc} as {metric.name}")
+                # Convert spaces and special characters to underscores
+                safe_name = metric.name.lower().replace(' ', '_').replace('.', '_').replace('-', '_')
+                metric_calculations.append(f"{calc} as {safe_name}")
 
             # Get dimensions
             dimensions = self._identify_dimensions(schema)
@@ -842,11 +842,11 @@ class DynamicAnalysisService:
                         {dimension_clause + ',' if dimension_clause else ''}
                         {', '.join(metric_calculations)}
                     FROM {table_name}
-                    WHERE {date_column} BETWEEN '{start_date}' AND '{end_date}'
+                    WHERE {date_column} BETWEEN %s AND %s
                     GROUP BY period {', ' + dimension_clause if dimension_clause else ''}
+                    ORDER BY period DESC
                 )
                 SELECT * FROM base_data
-                ORDER BY period DESC
             """
 
             return query
