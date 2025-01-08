@@ -1102,7 +1102,8 @@ class DynamicAnalysisService:
             forecast_result = await self._generate_optimized_forecast(
                 df,
                 forecast_points,
-                model_choice
+                model_choice,
+                resolution
             )
 
             # Cache the results
@@ -1162,58 +1163,77 @@ class DynamicAnalysisService:
         self,
         df: pd.DataFrame,
         forecast_horizon: int,
-        model_choice: str
+        model_choice: str,
+        resolution: str = 'daily'
     ) -> Dict[str, Any]:
-            """Generate forecast using the selected model."""
-            try:
-                loop = asyncio.get_event_loop()
-                
-                if model_choice == 'prophet':
-                    forecast_func = self._prophet_forecast
-                elif model_choice == 'sarima':
-                    forecast_func = self._sarima_forecast
-                else:
-                    forecast_func = self._exp_smoothing_forecast
-                
-                # Run the selected model in a thread pool
-                forecast_values, metrics = await loop.run_in_executor(
-                    None,
-                    lambda: forecast_func(df.copy(), forecast_horizon)
+        """Generate forecast using the selected model."""
+        try:
+            loop = asyncio.get_event_loop()
+            
+            if model_choice == 'prophet':
+                forecast_func = self._prophet_forecast
+            elif model_choice == 'sarima':
+                forecast_func = self._sarima_forecast
+            else:
+                forecast_func = self._exp_smoothing_forecast
+            
+            # Run the selected model in a thread pool
+            forecast_values, metrics = await loop.run_in_executor(
+                None,
+                lambda: forecast_func(df.copy(), forecast_horizon)
+            )
+
+            if forecast_values is None:
+                raise ValueError(f"Forecast failed for {model_choice}")
+
+            # Ensure the index is a DatetimeIndex
+            df = df.reset_index()
+            if 'ds' not in df.columns and 'period' in df.columns:
+                df = df.rename(columns={'period': 'ds'})
+            
+            # Convert ds column to datetime if it's not already
+            df['ds'] = pd.to_datetime(df['ds'])
+            
+            # Get the last date, ensuring it's a Timestamp
+            last_date = pd.Timestamp(df['ds'].max())
+
+            # Create forecast dates based on resolution
+            if resolution == 'monthly':
+                # For monthly, start from the first day of next month
+                next_month = last_date + pd.offsets.MonthBegin(1)
+                forecast_dates = pd.date_range(
+                    start=next_month,
+                    periods=forecast_horizon,
+                    freq='MS'  # Month Start frequency
                 )
-
-                if forecast_values is None:
-                    raise ValueError(f"Forecast failed for {model_choice}")
-
-                # Ensure the index is a DatetimeIndex
-                df = df.reset_index()
-                if 'ds' not in df.columns and 'period' in df.columns:
-                    df = df.rename(columns={'period': 'ds'})
-                
-                # Convert ds column to datetime if it's not already
-                df['ds'] = pd.to_datetime(df['ds'])
-                
-                # Get the last date, ensuring it's a Timestamp
-                last_date = pd.Timestamp(df['ds'].max())
-
-                # Create forecast dates using the last date + increments
+            elif resolution == 'weekly':
+                # For weekly, start from the next week
+                next_week = last_date + pd.offsets.Week(weekday=0)  # Start on Monday
+                forecast_dates = pd.date_range(
+                    start=next_week,
+                    periods=forecast_horizon,
+                    freq='W-MON'  # Weekly frequency starting Monday
+                )
+            else:  # daily
                 forecast_dates = pd.date_range(
                     start=last_date + pd.Timedelta(days=1),
                     periods=forecast_horizon,
                     freq='D'
                 )
 
-                # Format results
-                return self._format_forecast_results(
-                    last_date,  # Last date
-                    forecast_dates,
-                    forecast_values,
-                    metrics,
-                    model_choice
-                )
+            # Format results
+            return self._format_forecast_results(
+                last_date,
+                forecast_dates,
+                forecast_values,
+                metrics,
+                model_choice
+            )
 
-            except Exception as e:
-                logger.error(f"Error in optimized forecast: {str(e)}")
-                raise
+        except Exception as e:
+            logger.error(f"Error in optimized forecast: {str(e)}")
+            raise
+
         
     def _get_historical_data_length(
         self,
@@ -1236,6 +1256,7 @@ class DynamicAnalysisService:
             return 0
 
     def get_forecastable_metrics(
+        self,
         db: Session,
         current_user: dict
     ) -> Dict[str, Any]:
@@ -2492,19 +2513,24 @@ class DynamicAnalysisService:
                 connection.source_type
             )
 
-            # Use metric name as column name
+            # Format safe column names by replacing spaces with underscores
+            safe_metric_name = metric.name.lower().replace(' ', '_')
+            
+            # Use metric name as column name with proper escaping
             query = f"""
             WITH metric_data AS (
                 SELECT 
                     {period_expression}::date as period,
-                    CAST({metric.calculation} AS FLOAT) as {metric.name}
+                    CAST({metric.calculation} AS FLOAT) as {safe_metric_name}
                 FROM {connection.table_name}
-                WHERE {connection.date_column} BETWEEN '{start_date}' AND '{end_date}'
+                WHERE {connection.date_column} BETWEEN %s AND %s
                 GROUP BY period
             )
-            SELECT period, {metric.name}
+            SELECT 
+                period,
+                {safe_metric_name}
             FROM metric_data
-            WHERE {metric.name} IS NOT NULL
+            WHERE {safe_metric_name} IS NOT NULL
             ORDER BY period ASC
             """
 
@@ -2512,15 +2538,24 @@ class DynamicAnalysisService:
             loop = asyncio.get_event_loop()
             connector = self._get_connector(connection)
             try:
+                # Pass parameters safely to avoid SQL injection
                 results = await loop.run_in_executor(
                     None, 
-                    lambda: connector.query(query)
+                    lambda: connector.query(query, (start_date, end_date))
                 )
                 
                 logger.info(f"Query returned {len(results)} rows")
-                if results:
-                    logger.info(f"Sample result: {results[0]}")
-                return results
+                
+                # Format results to use the original metric name
+                formatted_results = []
+                for row in results:
+                    formatted_row = {
+                        'period': row['period'],
+                        metric.name: row[safe_metric_name]  # Map back to original name
+                    }
+                    formatted_results.append(formatted_row)
+                
+                return formatted_results
             finally:
                 connector.disconnect()
 
