@@ -1,5 +1,4 @@
-# services/metric_discovery.py
-
+#app/services/metric_discovery.py
 import logging
 from typing import List, Dict, Any, Tuple
 from openai import OpenAI
@@ -67,12 +66,7 @@ class MetricDiscoveryService:
     }}
     ]
 
-    Focus on metrics related to:
-    1. Employee Performance
-    2. Training and Development
-    3. Satisfaction and Retention
-    4. Workload and Efficiency
-    5. Compensation and Growth
+    Focus on metrics that hepls a decision maker make better analyticaal decisions.
 
     IMPORTANT: Return only the JSON array with no additional text or formatting."""
         
