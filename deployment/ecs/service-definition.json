@@ -1,0 +1,27 @@
+{
+    "cluster": "${METRIC_CLUSTER_NAME}",
+    "serviceName": "${METRIC_SERVICE_NAME}",
+    "taskDefinition": "${METRIC_APP_NAME}",
+    "desiredCount": 1,
+    "launchType": "FARGATE",
+    "networkConfiguration": {
+        "awsvpcConfiguration": {
+            "subnets": [
+                "${VPC_SUBNET_1}",
+                "${VPC_SUBNET_2}"
+            ],
+            "securityGroups": [
+                "${SECURITY_GROUP}"
+            ],
+            "assignPublicIp": "ENABLED"
+        }
+    },
+    "loadBalancers": [
+        {
+            "targetGroupArn": "${METRIC_TARGET_GROUP_ARN}",
+            "containerName": "${METRIC_APP_NAME}",
+            "containerPort": 8000
+        }
+    ],
+    "healthCheckGracePeriodSeconds": 120
+}
