@@ -1,10 +1,11 @@
+#backend-metrics/deployment/docker-compose.yml
 version: '3.8'
 services:
   app:
     env_file:
-     - ../../.env 
+     - ../../.env  
     build:
-      context: .
+      context: ..
       dockerfile: deployment/Dockerfile
     ports:
       - "8000:8000"

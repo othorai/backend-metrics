@@ -12,3 +12,6 @@ __pycache__/
 .cache/
 arkham.py
 arkham.csv
+
+# Generated task definition
+services/backend-auth/deployment/ecs/task-definition.json
