@@ -1,17 +1,17 @@
-# Ignore environment variable files
-.env
+# macOS system files
+.DS_Store
 
-# Ignore virtual environments
-venv/
-
-# Ignore Python cache files
+# Compiled Python files
+*.pyc
 __pycache__/
 *.py[cod]
-
-# Ignore cache directories for other tools
 .cache/
-arkham.py
-arkham.csv
+
+# Virtual environment
+venv/
+
+# Environment variables
+.env
 
 # Generated task definition
 services/backend-auth/deployment/ecs/task-definition.json

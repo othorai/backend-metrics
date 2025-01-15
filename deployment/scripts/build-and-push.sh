@@ -24,6 +24,7 @@ docker buildx build \
     --build-arg DB_HOST=$DB_HOST \
     --build-arg DB_PORT=$DB_PORT \
     --build-arg DB_NAME=$DB_NAME \
+    --build-arg DB_NAME=$DB_SSLMODE \
     -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$METRIC_APP_NAME:latest \
     -f deployment/Dockerfile . || handle_error "Failed to build and push image"
 

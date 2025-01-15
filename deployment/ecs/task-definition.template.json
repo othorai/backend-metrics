@@ -39,6 +39,18 @@
                 {
                     "name": "DEBUG",
                     "value": "True"
+                },
+                {
+                    "name": "POSTGRES_SSLMODE",
+                    "value": "require"
+                },
+                {
+                    "name": "PGSSLMODE",
+                    "value": "require"
+                },
+                {
+                    "name": "DB_SSLMODE",
+                    "value": "require"
                 }
             ],
             "secrets": [
