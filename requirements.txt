@@ -131,3 +131,4 @@ Werkzeug==3.0.4
 zeep==4.2.1
 pdfkit==1.0.0
 reportlab==4.2.5
+pyodbc==5.0.0

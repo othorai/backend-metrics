@@ -1,10 +1,9 @@
-# connectors/connector_factory.py
-
 from app.connectors.mysql_connector import MySQLConnector
 from app.connectors.postgresql_connector import PostgreSQLConnector
 from app.connectors.google_sheets_connector import GoogleSheetsConnector
 from app.connectors.salesforce_connector import SalesforceConnector
 from app.connectors.snowflake_connector import SnowflakeConnector
+from app.connectors.mongodb_connector import MongoDBConnector
 
 class ConnectorFactory:
     @staticmethod
@@ -19,10 +18,18 @@ class ConnectorFactory:
         elif connector_type == 'postgresql':
             return PostgreSQLConnector(
                 host=kwargs.get('host'),
-                username=kwargs.get('username') or kwargs.get('user'),  # Try both username and user
+                username=kwargs.get('username') or kwargs.get('user'),
                 password=kwargs.get('password'),
                 database=kwargs.get('database'),
                 port=kwargs.get('port', 5432)
+            )
+        elif connector_type == 'mongodb':
+            return MongoDBConnector(
+                host=kwargs.get('host'),
+                username=kwargs.get('username') or kwargs.get('user'),
+                password=kwargs.get('password'),
+                database=kwargs.get('database'),
+                port=kwargs.get('port', 27017)
             )
         elif connector_type == 'google_sheets':
             return GoogleSheetsConnector(
@@ -39,7 +46,7 @@ class ConnectorFactory:
         elif connector_type == 'snowflake':
             return SnowflakeConnector(
                 account=kwargs.get('account'),
-                username=kwargs.get('username') or kwargs.get('user'), 
+                username=kwargs.get('username') or kwargs.get('user'),
                 password=kwargs.get('password'),
                 warehouse=kwargs.get('warehouse'),
                 database=kwargs.get('database'),
